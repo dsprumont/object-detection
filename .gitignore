@@ -1,0 +1,34 @@
+# output dir
+output
+
+*.jpg
+*.png
+*.txt
+*.json
+*.diff
+
+# compilation and distribution
+__pycache__
+
+# pytorch/python/numpy formats
+*.pth
+*.pkl
+*.npy
+
+# ipython/jupyter notebooks
+*.ipynb
+**/.ipynb_checkpoints/
+
+# Editor temporaries
+*.swn
+*.swo
+*.swp
+*~
+
+# editor settings
+.idea
+.vscode
+
+# project dirs
+/datasets
+
