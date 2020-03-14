@@ -1,3 +1,9 @@
+# installation dir
+cocoapi
+
+# project dir
+datasets
+
 # output dir
 output
 
@@ -28,7 +34,4 @@ __pycache__
 # editor settings
 .idea
 .vscode
-
-# project dirs
-/datasets
 

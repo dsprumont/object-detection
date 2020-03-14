@@ -3,6 +3,7 @@
 
 import glob
 import os
+import platform
 import shutil
 from os import path
 from setuptools import find_packages, setup
@@ -13,6 +14,8 @@ from torch.utils.cpp_extension import CUDA_HOME, CppExtension, CUDAExtension
 torch_ver = [int(x) for x in torch.__version__.split(".")[:2]]
 assert torch_ver >= [1, 3], "Requires PyTorch >= 1.3"
 
+
+IS_WINDOWS = (platform.system() == 'Windows')
 
 def get_version():
     init_py_path = path.join(path.abspath(path.dirname(__file__)), "detectron2", "__init__.py")
@@ -51,7 +54,26 @@ def get_extensions():
     extension = CppExtension
 
     extra_compile_args = {"cxx": []}
+    extra_link_args = []
     define_macros = []
+    
+    if IS_WINDOWS:
+        # /NODEFAULTLIB makes sure we only link to DLL runtime
+        # and matches the flags set for protobuf and ONNX
+        extra_link_args = ['/NODEFAULTLIB:LIBCMT.LIB']
+        # /MD links against DLL runtime
+        # and matches the flags set for protobuf and ONNX
+        # /Z7 turns on symbolic debugging information in .obj files
+        # /EHa is about native C++ catch support for asynchronous
+        # structured exception handling (SEH)
+        # /DNOMINMAX removes builtin min/max functions
+        # /wdXXXX disables warning no. XXXX
+
+        extra_compile_args['cxx'] = ['/MD', '/Z7',
+                              '/EHa', '/DNOMINMAX',
+                              '/wd4267', '/wd4251', '/wd4522', '/wd4522', '/wd4838',
+                              '/wd4305', '/wd4244', '/wd4190', '/wd4101', '/wd4996',
+                              '/wd4275']
 
     if (
         torch.cuda.is_available() and CUDA_HOME is not None and os.path.isdir(CUDA_HOME)
@@ -80,6 +102,7 @@ def get_extensions():
             include_dirs=include_dirs,
             define_macros=define_macros,
             extra_compile_args=extra_compile_args,
+            extra_link_args=extra_link_args,
         )
     ]
 

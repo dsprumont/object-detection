@@ -19,6 +19,7 @@ detectron2.egg-info/
 build/
 dist/
 wheels/
+detectron2/_C.cp36-win_amd64.pyd
 
 # pytorch/python/numpy formats
 *.pth
