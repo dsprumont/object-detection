@@ -20,12 +20,12 @@ This directory contains scripts that use Detectron2
 
    To train the model from a given configuration:  
    ```  
-   python train_backbone.py --model-config config/base_feature_extractor.yaml  
+   python train_backbone.py --model-config configs/base_feature_extractor.yaml  
    ```  
 
    To evaluate a trained model:  
    ```  
-   python train_backbone.py --model-config config/base_feature_extractor.yaml --eval-only  
+   python train_backbone.py --model-config configs/base_feature_extractor.yaml --eval-only  
    ```  
    This evaluate the model over the cfg.DATASET.TEST defined in the config file.  
 
