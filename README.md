@@ -7,6 +7,15 @@ The objectives of this project are
 
 The works is currently heavily based on [Detectron2](https://github.com/facebookresearch/detectron2), a deep learning-based detection framework developed by [Facebook](https://ai.facebook.com/research/), and powered by Pytorch.
 
+## Applications
+
+See [Applications](applications/detectron2/) for a list of applications built with Detectron2.
+
+- [x] Train a simple backbone model (Resnet-like)
+- [ ] Train a full detector model (Faster-rcnn, ..)
+- [ ] Fetch data from cytomine directly into detectron2 
+- [ ] .. 
+
 ## Licence
 
 This project is released under the [Apache 2.0 license](LICENSE).
