@@ -14,7 +14,7 @@ This directory contains scripts that use Detectron2
 
 * `train_backbone.py`
 
-   This script is used to train a [backbone model](modelling/) from scratch with Detectron2 core functions.  
+   This script is used to train a [backbone model](modeling/) from scratch with Detectron2 core functions.  
    * Training is actually performed on single GPU.  
    * The script only takes a .yaml as input. The specific yaml node (MODEL.WEIGHTS, OUTPUT_DIR, ..) attribution is not yet available.  
    * Dataset is defined in the main function. Detectron2 DatasetCatalog/MetadataCatalog are used to register the dataset.
