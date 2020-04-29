@@ -1,15 +1,18 @@
+# common dependencies
 import datetime
 import logging
 import time
 import copy
 import torch
+import torch.nn as nn
 import numpy as np
 from collections import OrderedDict
 from contextlib import contextmanager
 
+# Detectron2 dependencies
 from detectron2.utils.comm import get_world_size, is_main_process
 from detectron2.utils.logger import log_every_n_seconds, create_small_table
-from detectron2.evaluation import DatasetEvaluator
+from detectron2.evaluation import DatasetEvaluator, inference_on_dataset
 from detectron2.data import MetadataCatalog
 
 
@@ -20,9 +23,10 @@ class BinaryClassificationEvaluator(DatasetEvaluator):
     In the provided datasets, labels 0 corresponds to negative class.
     """
     
-    def __init__(self, dataset_name, output_dir=None):
+    def __init__(self, dataset_name, output_dir=None, validate=False):
 
         self.output_dir = output_dir
+        self.validate = validate
 
         self._cpu_device = torch.device("cpu")
         self._logger = logging.getLogger("detectron2") # instead of __name__
@@ -34,10 +38,11 @@ class BinaryClassificationEvaluator(DatasetEvaluator):
 
     def reset(self):
         self._predictions = {
-            'image_id': [],
             'gt_cls': [],
             'pred_cls': []
         }
+        if self.validate:
+            self._predictions['logits'] = []
 
 
     def process(self, inputs, outputs):
@@ -45,12 +50,12 @@ class BinaryClassificationEvaluator(DatasetEvaluator):
         Accumulate ground_truth and predicted labels.
         """
         for input, output in zip(inputs, outputs):
-            self._predictions['image_id'].append(input['image_id'])
             self._predictions['gt_cls'].append(input['label'])
+            if self.validate:
+                self._predictions['logits'].append(output.to(self._cpu_device))
             pred_logits = output.to(self._cpu_device).numpy()
             pred_cls = np.argmax(pred_logits)
             self._predictions['pred_cls'].append(pred_cls)
-        
 
 
     def evaluate(self):
@@ -63,9 +68,14 @@ class BinaryClassificationEvaluator(DatasetEvaluator):
 
         predictions = self._predictions
 
-        if len(predictions['image_id']) == 0:
+        if len(predictions['gt_cls']) == 0:
             self._logger.warning("[BinaryClassificationEvaluator] Did not receive valid predictions.")
             return {}
+
+        if self.validate:
+            pred_tensor = torch.stack(predictions['logits'], dim=0)
+            gt_tensor = torch.LongTensor(predictions['gt_cls'])
+            loss = nn.CrossEntropyLoss()(pred_tensor, gt_tensor)
 
         # if self._output_dir:
         #     PathManager.mkdirs(self._output_dir)
@@ -94,11 +104,11 @@ class BinaryClassificationEvaluator(DatasetEvaluator):
         self._results = OrderedDict()
         class_names = self._metadata.thing_classes # Indicate which class is Positive
         
-        self._results['ErrorRate'] = (fp + fn) / (N + P)
-        self._results['Accuracy'] = (tp + tn) / (N + P)
-        self._results['Precision'] = tp / (tp + fp)
-        self._results['Recall'] = tp / P
-        self._results['Specificity'] = 1 - fp / N
+        self._results['ErrorRate'] = (fp + fn) / ((N + P) + 1e-5)
+        self._results['Accuracy'] = (tp + tn) / ((N + P) + 1e-5)
+        self._results['Precision'] = tp / ((tp + fp) + 1e-5)
+        self._results['Recall'] = tp / (P + 1e-5)
+        self._results['Specificity'] = 1 - fp / (N + 1e-5)
 
         results = {
             key: float(value * 100 if self._results[key] >= 0 else "nan")
@@ -110,6 +120,9 @@ class BinaryClassificationEvaluator(DatasetEvaluator):
         self._results[class_names[1]+'(P)'] = P
         self._results[class_names[0]+'(N)'] = N
 
+        if self.validate:
+            self._results['loss_cls'] = loss
+
         self._logger.info(
             "Evaluation results for classification: \n" + create_small_table(results)
         )
@@ -117,3 +130,4 @@ class BinaryClassificationEvaluator(DatasetEvaluator):
             self._logger.info("Note that some metrics cannot be computed.")
 
         return copy.deepcopy(self._results)
+

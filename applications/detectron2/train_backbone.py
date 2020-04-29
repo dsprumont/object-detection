@@ -6,6 +6,7 @@ import time
 import torch
 import torch.nn.functional as F
 from collections import OrderedDict
+from fvcore.common.file_io import PathManager
 
 # Detectron2 dependencies
 from detectron2.config import get_cfg
@@ -30,7 +31,7 @@ from fal_syn_dataset import get_cls_dataset
 
 logger = logging.getLogger("detectron2")
 
-def do_train(cfg, model, resume=False):
+def do_train(cfg, model, resume=False, evaluate=False):
     """
     training loop.
     """
@@ -57,10 +58,12 @@ def do_train(cfg, model, resume=False):
         if comm.is_main_process()
         else []
     )
+
     # Build dataloader
     data_loader = build_classification_train_loader(cfg)
 
     # training loop
+    validation_losses = []
     logger.info("Starting training from iteration {}".format(start_iter))
     with EventStorage(start_iter) as storage:
         start = time.perf_counter()
@@ -95,7 +98,15 @@ def do_train(cfg, model, resume=False):
                 and iteration % cfg.TEST.EVAL_PERIOD == 0)
                 or (iteration == max_iter)
             ):
-                do_test(cfg, model)
+                # evaluate on the validation dataset
+                res = do_test(cfg, model, evaluate=evaluate)
+                validation = {}
+                for k, v in res.items():
+                    print(v, flush=True)
+                    validation[k] = v['loss_cls']
+                    storage.put_scalars(**validation) # dump also validation loss into Tensorboard
+                    validation['iteration']  = iteration
+                validation_losses.append(validation)
 
             # logging/checkpoint
             if iteration - start_iter > 5 and (iteration % 20 == 0 or iteration == max_iter):
@@ -106,30 +117,39 @@ def do_train(cfg, model, resume=False):
             #Try to get an accurate measuremetn of time
             start = time.perf_counter()
 
+    # save validations metrics
+    if evaluate:
+        print(validation_losses, flush=True)
+        file_path = os.path.join(cfg.OUTPUT_DIR, "validations_losses.pth")
+        with PathManager.open(file_path, "wb") as f:
+            torch.save(validation_losses, f)
 
 
-def do_test(cfg, model):
+
+def do_test(cfg, model, evaluate=False):
     """
     run inference on model:
         preds = model(data)
-
-    accumulate results (ErrorRate, Accuracy, Precision, Recall, Specificity)
+    accumulate results (ErrorRate, Accuracy, Precision, Recall, Specificity):
         metrics = compute_metrics(preds)
-
     log aggregated results
+
+    When evaluate is True, returns also the evaluation loss
     """
     results = OrderedDict()
     for dataset_name in cfg.DATASETS.TEST:
         data_loader = build_classification_test_loader(cfg, dataset_name)
 
         evaluator = BinaryClassificationEvaluator(
-            dataset_name, os.path.join(cfg.OUTPUT_DIR, "inference", dataset_name))
+            dataset_name,
+            os.path.join(cfg.OUTPUT_DIR, "inference", dataset_name),
+            evaluate)
 
         results_i = inference_on_dataset(model, data_loader, evaluator)
         results[dataset_name] = results_i
 
-    if len(results) == 1:
-        results = list(results.values())[0]
+    # if len(results) == 1:
+        # results = list(results.values())[0]
     return results
 
 
@@ -141,6 +161,10 @@ def setup(args):
     cfg = get_cfg()
     add_simple_resnet_config(cfg)
     cfg.merge_from_file(args.model_config)
+
+    cfg.OUTPUT_DIR = "./output_debug"
+    cfg.TEST.EVAL_PERIOD = 20
+    cfg.SOLVER.MAX_ITER = 100
 
     if args.eval_only==True:
         # cfg.OUTPUT_DIR = "./output_eval"
@@ -198,7 +222,7 @@ def main(args):
         return do_test(cfg, model)
 
     # Train de model
-    do_train(cfg, model, resume=False)
+    do_train(cfg, model, resume=False, evaluate=True)
     return do_test(cfg, model)
 
 
