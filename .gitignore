@@ -1,11 +1,21 @@
 # installation dir
 cocoapi
+Cytomine-Python-Client-2.5.1
 
 # project dir
 datasets
+# applications/detectron2/data
+applications/detection2/configs
+
 
 # output dir
 output
+applications/detectron2/*output*
+
+# debug or local
+applications/detectron2/*debug*
+applications/detectron2/local
+applications/pytorch
 
 *.jpg
 *.png

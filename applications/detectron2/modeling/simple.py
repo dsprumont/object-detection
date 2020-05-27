@@ -79,40 +79,63 @@ def load_backbone_weights(model, path):
 
 def add_simple_resnet_config(cfg):
     """
-    Add config for simple resnet.
+    Add config for resnet-like model.
     """
     _C = cfg
     _C.MODEL.BACKBONE.NUM_CLASSES = 2
-    _C.MODEL.BACKBONE.CLASSIFIER = "linear"
+    _C.MODEL.BACKBONE.CLASSIFIER = "logits"
+    _C.MODEL.RESNETS.BLOCKS_PER_STAGE = [1, 1, 1, 1]
+    _C.MODEL.RESNETS.STEM_KERNEL = 7
+    _C.MODEL.RESNETS.STEM_STRIDE = 2
+    _C.MODEL_RESNETS.STEM_POOLING_ON = True
 
 
 # highly inspired from
 # https://github.com/facebookresearch/detectron2/blob/2292cb3f24cea3d5f77f36dbd8aaf1b8d8d14e08/detectron2/modeling/backbone/resnet.py
-class BasicStem(nn.Module):
-    def __init__(self, in_channels=3, out_channels=64, norm="BN"):
-        """
-        Args:
-            norm (str or callable): a callable that takes the number of
-                channels and return a `nn.Module`, or a pre-defined string
-                (one of {"FrozenBN", "BN", "GN"}).
-        """
+class StemBlock(nn.Module):
+    """
+    First block in a Resnet architecture.
+    """
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=7,
+        stride=2,
+        pooling=nn.MaxPool2d,
+        norm="BN"
+    ):
         super().__init__()
-        self.conv1 = Conv2d(
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        # args stride is for the conv layer,
+        # self.stride is for the whole module (stride + maxpool)
+        self.stride = stride*2
+        self.kernel_size = kernel_size
+        self.pooling = pooling
+
+        self.conv1 = Conv2dWithNorm(
             in_channels,
             out_channels,
-            kernel_size=3, # change from 7 to 3
-            stride=1, # change from 2 to 1: makes output_stride lower 4 -> 2
-            padding=1, # change from 3 to 1: keeps ouput_size = input_size
+            kernel_size=kernel_size,  # Original is 7 /!\
+            stride=stride,
+            padding=int((kernel_size-1)/2),  # Original is 3 /!\
             bias=False,
-            norm=get_norm(norm, out_channels),
+            norm=get_norm(norm, out_channels)
         )
-        weight_init.c2_msra_fill(self.conv1)
+        self.relu = nn.ReLU(inplace=True)
+        if pooling is not None:
+            self.maxpool = pooling(kernel_size=3, stride=2, padding=1)
+
+        nn.init.kaiming_normal_(self.conv1.weight, nonlinearity='relu')
 
     def forward(self, x):
-        x = self.conv1(x)
-        x = F.relu_(x)
-        x = F.max_pool2d(x, kernel_size=3, stride=2, padding=1)
-        return x
+        h = self.conv1(x)
+        h = self.relu(h)
+        if self.pooling is not None:
+            h = self.maxpool(h)
+        return h
 
     @property
     def out_channels(self):
@@ -123,86 +146,176 @@ class BasicStem(nn.Module):
         return 2  # = stride 1 conv -> stride 2 max pool
 
 
+class ResNetLike(nn.Module):
+
+    def __init__(self, stem, blocks, num_classes, out_features=['logits'], freeze_at=0):
+        super().__init__()
+        self.stem = stem
+        self.out_features = out_features
+        self.out_feature_channels = {'stem': stem.out_channels}
+        self.out_feature_stride = {'stem': stem.stride}
+
+        last_channels = 0
+        curr_stride = stem.stride
+        self.res = []
+        for n, block in enumerate(blocks):
+            layers = []
+            name = 'res'+str(n+2)
+            in_channels = block['in_channels']
+            for idx in range(block['count']):
+                stride = 1 if (idx > 0 or block['dilation'] > 1) else 2
+                out_channels = block['out_channels']
+                layers.append(
+                    Bottleneck(
+                        in_channels=in_channels,
+                        out_channels=out_channels,
+                        bottleneck_channels=block['bottleneck_channels'],
+                        stride=stride,
+                        dilation=block['dilation']
+                    )
+                )
+                in_channels = out_channels
+                last_channels = out_channels
+            curr_stride = curr_stride * 2
+            self.out_feature_channels[name] = last_channels
+            self.out_feature_stride[name] = curr_stride
+
+            if freeze_at >= stage_idx:
+                for layer in layers:
+                    layer.freeze()
+
+            module = nn.Sequential(*layers)
+            self.res.append([name, module])
+            self.add_module(name, module)
+
+        if 'logits' in out_features:
+            self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+            self.linear = nn.Linear(last_channels, num_classes)
+            nn.init.normal_(self.linear.weight, std=0.01)
+
+    def forward(self, x):
+        out = {}
+        h = self.stem(x)
+        if 'stem' in self.out_features:
+            out['stem'] = h
+        for name, res in self.res:
+            h = res(h)
+            if name in self.out_features:
+                out[name] = h
+        if 'logits' in self.out_features:
+            h = self.avgpool(h)
+            h = torch.flatten(h, 1)  # flatten all dimensions, except batch dim
+            h = self.linear(h)
+            out['logits'] = h
+        return out
+
+    def stage_outputs(self):
+        # print(self.out_features)
+        return {name: {
+            'stride': self.out_feature_stride[name],
+            'channels': self.out_feature_channels[name]}
+            for name in self.out_features
+            }
+
+    @staticmethod
+    def build(name, input_channels, num_classes, out_features=['logits']):
+        cfg = CONFIGURATIONS.get(name, None)
+        if cfg is None:
+            raise AttributeError(
+                "The given resnet configuration is not available.")
+            sys.exit()
+
+        in_channels = input_channels
+        bottleneck_channels: int = cfg['stem_out_channels']
+        out_channels: int = cfg['res2_out_channels']
+
+        stem = StemBlock(
+            in_channels=in_channels,
+            out_channels=cfg['stem_out_channels'],
+            stride=cfg['stem_stride'],
+            kernel_size=cfg['stem_kernel'],
+            pooling=cfg['stem_pooling']
+        )
+
+        blocks = []
+        in_channels = cfg['stem_out_channels']
+        bottleneck_channels = cfg['res2_bottleneck_channels']
+        out_channels = cfg['res2_out_channels']
+        blocks_per_layer = cfg['resnet_layers']
+        dilations = cfg['resnet_dilations']
+
+        for idx in range(len(blocks_per_layer)):
+            block = {
+                'count': blocks_per_layer[idx],
+                'in_channels': in_channels,
+                'bottleneck_channels': bottleneck_channels,
+                'out_channels': out_channels,
+                'dilation': dilations[idx]
+            }
+            in_channels = out_channels
+            bottleneck_channels *= 2
+            out_channels *= 2
+            blocks.append(block)
+
+        return ResNetLike(stem, blocks, num_classes, out_features)
+
+
 # highly inspired from
 # https://github.com/facebookresearch/detectron2/blob/2292cb3f24cea3d5f77f36dbd8aaf1b8d8d14e08/detectron2/modeling/backbone/resnet.py
 @BACKBONE_REGISTRY.register()
-def build_simple_resnet_backbone(cfg, input_shape: ShapeSpec):
+def build_resnetlike_backbone(cfg, input_shape: ShapeSpec):
     """
     Create a ResNet instance from config.
     Returns:
         ResNet: a :class:`ResNet` instance.
     """
-    # need registration of new blocks/stems?
+        # fmt: off
+    out_features        = cfg.MODEL.RESNETS.OUT_FEATURES
+    num_classes         = cfg.MODEL.BACKBONE.NUM_CLASSES if "logits" in out_features else None
+    num_groups          = cfg.MODEL.RESNETS.NUM_GROUPS
+    width_per_group     = cfg.MODEL.RESNETS.WIDTH_PER_GROUP
+    bottleneck_channels = num_groups * width_per_group
+    in_channels         = cfg.MODEL.RESNETS.STEM_OUT_CHANNELS
+    out_channels        = cfg.MODEL.RESNETS.RES2_OUT_CHANNELS
+    num_blocks_per_stage = cfg.MODEL.RESNETS.BLOCKS_PER_STAGE
+    dilation_per_stage = cfg.MODEL.RESNETS.DILATION_PAR_STAGE
     norm = cfg.MODEL.RESNETS.NORM
-    stem = BasicStem(
+    freeze_at = cfg.MODEL.BACKBONE.FREEZE_AT
+    # fmt: on
+    
+    # need registration of new blocks/stems?
+    stem = StemBlock(
         in_channels=input_shape.channels,
         out_channels=cfg.MODEL.RESNETS.STEM_OUT_CHANNELS,
+        kernel_size=cfg.MODEL.RESNETS.STEM_KERNEL,
+        stride=cfg.MODEL.RESNETS.STEM_STRIDE,
+        pooling=nn.MaxPool2d if cfg.MODEL.RESNETS.STEM_POOLING_ON == True else None,
         norm=norm,
-    )
-    freeze_at = cfg.MODEL.BACKBONE.FREEZE_AT
+    )  
 
     if freeze_at >= 1:
         for p in stem.parameters():
             p.requires_grad = False
         stem = FrozenBatchNorm2d.convert_frozen_batchnorm(stem)
 
-    # fmt: off
-    out_features        = cfg.MODEL.RESNETS.OUT_FEATURES
-    depth               = cfg.MODEL.RESNETS.DEPTH
-    num_groups          = cfg.MODEL.RESNETS.NUM_GROUPS
-    width_per_group     = cfg.MODEL.RESNETS.WIDTH_PER_GROUP
-    bottleneck_channels = num_groups * width_per_group
-    in_channels         = cfg.MODEL.RESNETS.STEM_OUT_CHANNELS
-    out_channels        = cfg.MODEL.RESNETS.RES2_OUT_CHANNELS
-    num_classes         = cfg.MODEL.BACKBONE.NUM_CLASSES if "linear" in out_features else None
-    stride_in_1x1       = cfg.MODEL.RESNETS.STRIDE_IN_1X1
-    res5_dilation       = cfg.MODEL.RESNETS.RES5_DILATION
-    deform_on_per_stage = cfg.MODEL.RESNETS.DEFORM_ON_PER_STAGE
-    deform_modulated    = cfg.MODEL.RESNETS.DEFORM_MODULATED
-    deform_num_groups   = cfg.MODEL.RESNETS.DEFORM_NUM_GROUPS
-    # fmt: on
-    assert res5_dilation in {1, 2}, "res5_dilation cannot be {}.".format(res5_dilation)
-
-    num_blocks_per_stage = {
-        14: [1, 1, 1, 1], # added configuration: simple Resnet (1 block per level + in/FC)
-    }[depth]
-
-    stages = []
-
-    # Avoid creating variables without gradients
-    # It consumes extra memory and may cause allreduce to fail
-    out_stage_idx = [{"res2": 2, "res3": 3, "res4": 4, "res5": 5, "linear": 5}[f] for f in out_features]
+    out_stage_idx = [{"res2": 2, "res3": 3, "res4": 4, "res5": 5, "logits": 5}[f] for f in out_features]
     max_stage_idx = max(out_stage_idx)
-    for idx, stage_idx in enumerate(range(2, max_stage_idx + 1)):
-        dilation = res5_dilation if stage_idx == 5 else 1
-        first_stride = 1 if idx == 0 or (stage_idx == 5 and dilation == 2) else 2
-        stage_kargs = {
-            "num_blocks": num_blocks_per_stage[idx],
-            "first_stride": first_stride,
-            "in_channels": in_channels,
-            "out_channels": out_channels,
-            "norm": norm,
-            "bottleneck_channels": bottleneck_channels,
-            "stride_in_1x1": stride_in_1x1,
-            "dilation": dilation,
-            "num_groups": num_groups,
-        }
-        if deform_on_per_stage[idx]:
-            stage_kargs["block_class"] = DeformBottleneckBlock
-            stage_kargs["deform_modulated"] = deform_modulated
-            stage_kargs["deform_num_groups"] = deform_num_groups
-        else:
-            stage_kargs["block_class"] = BottleneckBlock
-        blocks = make_stage(**stage_kargs)
-        in_channels = out_channels
-        out_channels *= 2
-        bottleneck_channels *= 2
 
-        if freeze_at >= stage_idx:
-            for block in blocks:
-                block.freeze()
-        stages.append(blocks)
-    return ResNet(stem, stages, num_classes=num_classes, out_features=out_features)
+    blocks = []
+    for idx in range(2, max_stage_idx + 1):
+        block = {
+            'count': num_blocks_per_stage[idx],
+            'in_channels': in_channels,
+            'bottleneck_channels': bottleneck_channels,
+            'out_channels': out_channels,
+            'dilation': dilation_per_stage[idx]
+        }
+        in_channels = out_channels
+        bottleneck_channels *= 2
+        out_channels *= 2
+        blocks.append(block)
+
+    return ResNetLike(stem, stages, num_classes=num_classes, out_features=out_features, freeze_at=0)
 
 
 # taken from
@@ -231,7 +344,7 @@ def build_simple_resnet_fpn_backbone(cfg, input_shape: ShapeSpec):
     Returns:
         backbone (Backbone): backbone module, must be a subclass of :class:`Backbone`.
     """
-    bottom_up = build_simple_resnet_backbone(cfg, input_shape)
+    bottom_up = build_resnetlike_backbone(cfg, input_shape)
     in_features = cfg.MODEL.FPN.IN_FEATURES
     out_channels = cfg.MODEL.FPN.OUT_CHANNELS
     backbone = FPN(
